@@ -1,9 +1,7 @@
 [build]
   publish = "public"
-  functions = "functions"
   edge_functions = "netlify/edge-functions"
 
-# analyze is now an Edge Function — no timeout wall, streaming GPT-4o
 [[edge_functions]]
   path = "/api/analyze"
   function = "analyze"
@@ -11,8 +9,3 @@
 [[edge_functions]]
   path = "/api/transcribe"
   function = "transcribe"
-
-[[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/:splat"
-  status = 200
