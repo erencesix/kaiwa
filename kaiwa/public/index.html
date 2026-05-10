@@ -511,7 +511,7 @@ body{
         <div class="dz-ic"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:#6b7099"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg></div>
         <div class="dz-text">
           <h3>Drop your meeting recording here</h3>
-          <p>Any language · Up to 25MB · or click to browse</p>
+          <p>Any language · Up to 200MB · or click to browse</p>
           <div class="dz-types"><span>MP3</span><span>MP4</span><span>WAV</span><span>M4A</span><span>OGG</span><span>WEBM</span><span>MOV</span></div>
         </div>
       </div>
@@ -646,11 +646,18 @@ dz.addEventListener('dragleave',()=>dz.classList.remove('over'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('over');if(e.dataTransfer.files[0])pick(e.dataTransfer.files[0]);});
 
 function pick(f){
-  const MAX_MB = 25;
+  const MAX_MB = 200;
   const MAX_BYTES = MAX_MB * 1024 * 1024;
+  const ALLOWED_EXT = /\.(mp3|mp4|m4a|wav|ogg|webm|mov|flac)$/i;
   if(f.size > MAX_BYTES){
     const err=document.getElementById('err-box');
-    err.textContent='File too large ('+( f.size/1048576).toFixed(1)+' MB). Maximum is 25MB.';
+    err.textContent='File too large ('+( f.size/1048576).toFixed(1)+' MB). Maximum is 200MB.';
+    err.classList.add('on');
+    return;
+  }
+  if(!ALLOWED_EXT.test(f.name)){
+    const err=document.getElementById('err-box');
+    err.textContent='Unsupported file type. Please upload an audio or video file (MP3, MP4, M4A, WAV, OGG, WEBM, MOV, FLAC).';
     err.classList.add('on');
     return;
   }
@@ -674,7 +681,6 @@ function setStep(id,state){
 
 function showErr(msg){const e=document.getElementById('err-box');e.textContent=msg;e.classList.add('on');showPage('page-upload');}
 
-// API key is handled server-side — no key in the browser.
 
 function formatTimeFE(seconds){
   const m = Math.floor(seconds / 60);
@@ -683,6 +689,7 @@ function formatTimeFE(seconds){
 }
 
 // Streaming version for /api/analyze — reads GPT-4o tokens in real time via SSE.
+// Uses a proper line buffer so TCP chunk boundaries never split an SSE event.
 async function analyzeStream(body, onProgress) {
   const res = await fetch('/api/analyze', {
     method: 'POST',
@@ -698,40 +705,35 @@ async function analyzeStream(body, onProgress) {
 
   const reader = res.body.getReader();
   const dec = new TextDecoder();
-  let buf = '';
+  let lineBuf = '';
   let tokenCount = 0;
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    buf += dec.decode(value, { stream: true });
+    lineBuf += dec.decode(value, { stream: true });
 
-    const events = buf.split('\n\n');
-    buf = events.pop();
-
-    for (const evt of events) {
-      const line = evt.trim();
+    let nl;
+    while ((nl = lineBuf.indexOf('\n')) !== -1) {
+      const line = lineBuf.slice(0, nl).trimEnd();
+      lineBuf = lineBuf.slice(nl + 1);
       if (!line.startsWith('data: ')) continue;
       let msg;
       try { msg = JSON.parse(line.slice(6)); } catch { continue; }
-
       if (msg.error) throw new Error(msg.error);
-      if (msg.token) {
-        tokenCount += msg.token.length;
-        onProgress && onProgress(tokenCount);
-      }
+      if (msg.token) { tokenCount += msg.token.length; onProgress && onProgress(tokenCount); }
       if (msg.done) return msg.result;
     }
   }
 
-  throw new Error('Analysis stream closed unexpectedly. This may be a network issue — try again.');
+  throw new Error('Analysis stream closed unexpectedly — this is usually a network issue. Try again.');
 }
 
 async function transcribeChunked(file){
-  // Chunk size kept under 24MB to stay within Whisper's limit.
-  // Audio is sent to /api/transcribe — the edge function calls OpenAI server-side.
-  // The API key never touches the browser.
-  const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB — safely under Netlify Edge 20MB body limit
+  // Audio sent to /api/transcribe — API key never touches the browser.
+  // Chunks at 18MB to stay under Netlify Edge's 20MB body limit.
+  const CHUNK_SIZE = 18 * 1024 * 1024;
+  const MAX_RETRIES = 3;
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   let allSegments = [];
   let allText = '';
@@ -745,26 +747,40 @@ async function transcribeChunked(file){
 
     const descEl = document.querySelector('#ps-tr .p-desc');
     if(descEl) descEl.textContent = totalChunks > 1
-      ? 'Part ' + (i+1) + ' of ' + totalChunks + '...'
-      : 'Converting speech to text...';
+      ? 'Part ' + (i+1) + ' of ' + totalChunks + '\u2026'
+      : 'Converting speech to text\u2026';
 
-    // Send chunk to our edge function — no API key in the browser
-    const fd = new FormData();
-    fd.append('file', new File([chunk], file.name, {type: file.type || 'audio/mpeg'}));
-
-    const res = await fetch('/api/transcribe', {
-      method: 'POST',
-      body: fd
-    });
-
-    const text = await res.text();
-    let result;
-    try{ result = JSON.parse(text); }
-    catch(e){ throw new Error('Transcription server error: ' + text.substring(0,200)); }
-    if(result.error) throw new Error('Transcription error: ' + result.error);
+    // Retry loop — transient network errors shouldn't kill the whole job
+    let result = null;
+    let lastErr = null;
+    for(let attempt = 0; attempt < MAX_RETRIES; attempt++){
+      if(attempt > 0){
+        if(descEl) descEl.textContent = 'Retrying part ' + (i+1) + ' (attempt ' + (attempt+1) + ')\u2026';
+        await new Promise(r => setTimeout(r, 1500 * attempt));
+      }
+      try{
+        const fd = new FormData();
+        fd.append('file', new File([chunk], file.name, {type: file.type || 'audio/mpeg'}));
+        const res = await fetch('/api/transcribe', { method: 'POST', body: fd });
+        const text = await res.text();
+        let parsed;
+        try{ parsed = JSON.parse(text); }
+        catch(e){ throw new Error('Unexpected server response: ' + text.substring(0,200)); }
+        if(parsed.error) throw new Error(parsed.error);
+        result = parsed;
+        break;
+      } catch(e){
+        lastErr = e;
+      }
+    }
+    if(!result) throw new Error('Transcription failed after ' + MAX_RETRIES + ' attempts: ' + lastErr?.message);
 
     if(!result.text) continue;
-    if(!detectedLanguage && result.language) detectedLanguage = result.language;
+
+    // Normalize language string from Whisper (e.g. "japanese", "english")
+    if(!detectedLanguage && result.language){
+      detectedLanguage = result.language.toLowerCase().trim();
+    }
     allText += (allText ? ' ' : '') + result.text;
 
     const segs = (result.segments || []).map(s => ({
@@ -775,10 +791,12 @@ async function transcribeChunked(file){
     }));
     allSegments = allSegments.concat(segs);
 
+    // Advance time offset — use actual segment data when available,
+    // else estimate from byte size assuming ~128kbps compressed audio (MP3/M4A)
     if(result.segments && result.segments.length > 0){
       timeOffset += result.segments[result.segments.length - 1].end + 0.1;
     } else {
-      timeOffset += (end - start) / (16000);
+      timeOffset += (end - start) / 16000; // 128kbps = 16000 bytes/sec
     }
   }
 
@@ -821,8 +839,14 @@ async function run(){
   }
   render(anData,document.getElementById('show-tr').checked);
   }catch(e){
-    ['read','tr','an'].forEach(id=>{if(document.getElementById('ps-'+id).className.includes('active'))setStep(id,'err');});
-    showErr('Error: '+e.message);
+    // Mark the active step as failed — stays on progress page so user can see exactly where it broke
+    ['read','tr','an'].forEach(id=>{
+      const el=document.getElementById('ps-'+id);
+      if(el && el.className.includes('active')) setStep(id,'err');
+    });
+    const e2=document.getElementById('err-box');
+    e2.textContent='Error: '+e.message;
+    e2.classList.add('on');
   }
 }
 
